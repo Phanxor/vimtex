@@ -3,7 +3,9 @@
 " Maintainer: Karl Yngve Lervåg
 " Email:      karl.yngve@gmail.com
 "
-
+"
+" AI generated change.
+let s:texpresso_output = {}
 function! vimtex#compiler#texpresso#init(options) abort " {{{1
   return s:compiler.new(a:options)
 endfunction
@@ -17,6 +19,83 @@ let s:compiler = vimtex#compiler#_template#new({
       \ 'options' : [],
       \})
 
+function! s:texpresso_find_math_opener(path, lnum) abort
+  let l:lines = readfile(a:path)
+  let l:end = min([a:lnum, len(l:lines)])
+  let l:start = l:end
+
+  " Limit the search to the current paragraph.
+  while l:start > 1 && !empty(trim(l:lines[l:start - 2]))
+    let l:start -= 1
+  endwhile
+
+  let l:stack = []
+  let l:delimiters = [
+        \ ['\(', '\)'],
+        \ ['\[', '\]'],
+        \ ['$$', '$$'],
+        \ ['$', '$'],
+        \]
+
+  " Scan the paragraph from its beginning to the reported location.
+  for l:i in range(l:start, l:end)
+    let l:text = l:lines[l:i - 1]
+
+    " Remove comments, respecting escaped percent signs.
+    let l:text = substitute(l:text, '\%(^\|[^\\]\)\zs%.*$', '', '')
+
+    let l:pos = 0
+    while l:pos < strlen(l:text)
+      let l:found = {}
+      for l:delimiter in l:delimiters
+        let l:open = l:delimiter[0]
+        let l:close = l:delimiter[1]
+        let l:pattern = l:open ==# '$'
+              \ ? '\$\%(\$\)\@!'
+              \ : escape(l:open, '\')
+
+        let l:match = matchstrpos(l:text, l:pattern, l:pos)
+        if l:match[1] >= 0
+          if empty(l:found) || l:match[1] < l:found.pos
+            let l:found = {
+                  \ 'pos': l:match[1],
+                  \ 'open': l:open,
+                  \ 'close': l:close,
+                  \}
+          endif
+        endif
+      endfor
+
+      if empty(l:found)
+        break
+      endif
+
+      let l:pos = l:found.pos + strlen(l:found.open)
+
+      if l:found.open ==# '$'
+        if !empty(l:stack) && l:stack[-1].open ==# '$'
+          call remove(l:stack, -1)
+        else
+          call add(l:stack, {
+                \ 'line': l:i,
+                \ 'col': l:found.pos + 1,
+                \ 'open': '$',
+                \})
+        endif
+      else
+        call add(l:stack, {
+              \ 'line': l:i,
+              \ 'col': l:found.pos + 1,
+              \ 'open': l:found.open,
+              \ 'close': l:found.close,
+              \})
+      endif
+    endwhile
+  endfor
+
+  " Return the most recent unmatched opener.
+  return empty(l:stack) ? {} : l:stack[-1]
+endfunction
 function! s:compiler.__check_requirements() abort dict " {{{1
   if !executable('texpresso')
     call vimtex#log#warning('texpresso is not executable!')
@@ -28,7 +107,8 @@ endfunction
 function! s:compiler.__init() abort dict " {{{1
   let self.start = function('s:compiler_start', [self.start])
   let self.stop = function('s:compiler_stop', [self.stop])
-  call add(self.hooks, function('s:texpresso_process_message'))
+  call add(self.hooks,
+        \ function('s:texpresso_process_message', [self.file_info.target]))
 endfunction
 " }}}1
 
@@ -41,6 +121,7 @@ endfunction
 " }}}1
 
 function! s:compiler_start(super, ...) abort dict " {{{1
+  let s:texpresso_output[self.file_info.target] = []
   call call(a:super, a:000, self)
 
   augroup vimtex_compiler_texpresso
@@ -144,22 +225,19 @@ function! s:compiler.texpresso_send(...) abort dict " {{{1
 endfunction
 " }}}1
 
-function! s:texpresso_process_message(json) abort " {{{1
+" Changed!
+function! s:texpresso_process_message(path, json) abort
   for l:json in split(a:json, "\n")
     if !empty(l:json)
-      call s:texpresso_process_message_line(l:json)
+      call s:texpresso_process_message_line(a:path, l:json)
     endif
   endfor
 endfunction
 
-" }}}1
-
-function! s:texpresso_process_message_line(json) abort " {{{1
+function! s:texpresso_process_message_line(path, json) abort
   try
     let l:msg = json_decode(a:json)
   catch
-    " Hooks receive output from both stdout and stderr, so non-JSON lines
-    " (e.g. startup diagnostics) are expected and silently ignored.
     return
   endtry
 
@@ -168,27 +246,106 @@ function! s:texpresso_process_message_line(json) abort " {{{1
   endif
 
   if l:msg[0] ==# 'synctex'
-    let l:path = l:msg[1]
-    let l:lnum = l:msg[2]
-    call vimtex#view#inverse_search(l:lnum, l:path)
+    call vimtex#view#inverse_search(l:msg[2], l:msg[1])
+
   elseif l:msg[0] ==# 'truncate-lines'
-    let l:name = l:msg[1]
-    let l:count = l:msg[2]
-    if l:name ==# 'out'
-      call setqflist(slice(getqflist(), 0, l:count), 'r')
+    if l:msg[1] ==# 'out'
+      let l:raw = get(s:texpresso_output, a:path, [])
+      let s:texpresso_output[a:path] = slice(l:raw, 0, l:msg[2])
+      call s:texpresso_update_quickfix(a:path)
     endif
+
   elseif l:msg[0] ==# 'append-lines'
-    let l:name = l:msg[1]
-    let l:lines = l:msg[2:]
-    if l:name ==# 'out'
-      call setqflist([], 'a', {
-            \ 'lines': l:lines,
-            \ 'efm': '%t%*[^:]: %f:%l: %m',
-            \})
+    if l:msg[1] ==# 'out'
+      let l:raw = get(s:texpresso_output, a:path, [])
+      call extend(l:raw, split(join(l:msg[2:], ''), "\n", 1))
+      let s:texpresso_output[a:path] = l:raw
+      call s:texpresso_update_quickfix(a:path)
     endif
-  elseif l:msg[0] ==# 'flush'
-  else
-    " Here we can handle other types of messages
+  endif
+endfunction
+
+function! s:texpresso_update_quickfix(path) abort
+  let l:items = []
+  let l:pending = {}
+
+  for l:line in get(s:texpresso_output, a:path, [])
+    let l:line = substitute(l:line, '\r$', '', '')
+
+    " Errors start with ! and give their source line afterwards.
+    let l:error = matchlist(l:line, '^\s*!\s*\(.*\)$')
+    if !empty(l:error)
+      let l:pending = {
+            \ 'text': l:error[1],
+            \ 'type': 'E',
+            \}
+      continue
+    endif
+
+    " Warnings include their source line directly.
+    let l:warning = matchlist(
+          \ l:line,
+          \ '^\s*LaTeX Warning:\s*\(.\{-}\)\s\+on input line \(\d\+\)\.\s*$'
+          \)
+    if !empty(l:warning)
+      call add(l:items, {
+            \ 'filename': a:path,
+            \ 'lnum': str2nr(l:warning[2]),
+            \ 'type': 'W',
+            \ 'text': l:warning[1],
+            \})
+      continue
+    endif
+
+    " Errors use the form: l.123 <source text>
+    let l:source = matchlist(l:line, '^\s*l\.\(\d\+\)\s*\(.*\)$')
+    if !empty(l:source) && !empty(l:pending)
+      let l:lnum = str2nr(l:source[1])
+      let l:col = 1
+
+      if l:pending.text =~# '^Missing \$ inserted'
+        let l:opener = s:texpresso_find_math_opener(a:path, l:lnum)
+        if !empty(l:opener)
+          let l:lnum = l:opener.line
+          let l:col = l:opener.col
+        endif
+      endif
+
+      call add(l:items, {
+            \ 'filename': a:path,
+            \ 'lnum': l:lnum,
+            \ 'col': l:col,
+            \ 'type': l:pending.type,
+            \ 'text': l:pending.text,
+            \})
+      let l:pending = {}
+    endif
+  endfor
+
+  " Replace the previous TeXpresso diagnostics. This also removes
+  " errors that disappeared after an edit.
+  call setqflist([], 'r', {
+        \ 'title': 'TeXpresso diagnostics',
+        \ 'items': l:items,
+        \})
+
+  " Respect VimTeX's Quickfix window settings.
+  if get(g:, 'vimtex_quickfix_mode', 0) > 0
+    let l:errors = filter(copy(l:items), 'v:val.type ==# "E"')
+    let l:warnings = filter(copy(l:items), 'v:val.type ==# "W"')
+    let l:should_open = !empty(l:errors)
+          \ || (!empty(l:warnings)
+          \ && get(g:, 'vimtex_quickfix_open_on_warning', 0))
+
+    if l:should_open
+      let l:winid = win_getid()
+      botright cwindow
+      if g:vimtex_quickfix_mode == 2
+        call win_gotoid(l:winid)
+      endif
+    else
+      cclose
+    endif
   endif
 endfunction
 
